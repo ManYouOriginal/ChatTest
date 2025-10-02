@@ -1,513 +1,240 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-import json
-import uuid
-from datetime import datetime
-import redis.asyncio as redis
-from typing import Dict, List, Set
 import asyncio
+import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from sqlalchemy import (create_engine, MetaData, Table, Column, Integer, String,
+                        ForeignKey, select, insert, event)
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+
+
+DATABASE_URL = "sqlite+aiosqlite:///./chat.db"
+engine = create_async_engine(DATABASE_URL, echo=True)
+metadata = MetaData()
+
+
+messages = Table(
+    'messages', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('sender', String, nullable=False),
+    Column('recipient', String, nullable=True), 
+    Column('group_name', String, nullable=True), 
+    Column('content', String, nullable=False)
+)
+
+groups = Table(
+    'groups', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('name', String, unique=True, nullable=False)
+)
+
+group_members = Table(
+    'group_members', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('group_name', String, ForeignKey('groups.name')),
+    Column('username', String)
+)
+
+
+async_session = sessionmaker(
+    engine, expire_on_commit=False, class_=AsyncSession
+)
 
 app = FastAPI()
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+connected_users = {}
 
 
-redis_client = None
-
-async def get_redis():
-    global redis_client
-    if redis_client is None:
-        redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
-    return redis_client
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-        self.user_groups: Dict[str, Set[str]] = {}  
-        self.lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket, user_id: str):
-        await websocket.accept()
-        
-        async with self.lock:
-           
-            if user_id in self.active_connections:
-                try:
-                    await self.active_connections[user_id].close()
-                except Exception:
-                    pass
-                finally:
-                    del self.active_connections[user_id]
-            
-            self.active_connections[user_id] = websocket
-        
-       
-        redis_client = await get_redis()
-        await redis_client.sadd("online_users", user_id)
-        
-       
-        user_nickname = f"User {user_id}"
-        await redis_client.hset(f"user:{user_id}", "nickname", user_nickname)
-        
-       
-        user_groups_key = f"user:{user_id}:groups"
-        user_groups = await redis_client.smembers(user_groups_key)
-        self.user_groups[user_id] = set(user_groups)
-        
-       
-        await self.broadcast_users()
-        
-        print(f"User {user_id} connected. Online users: {len(self.active_connections)}")
-
-    async def disconnect(self, user_id: str):
-        async with self.lock:
-            if user_id in self.active_connections:
-                try:
-                    await self.active_connections[user_id].close()
-                except Exception:
-                    pass
-                finally:
-                    if user_id in self.active_connections:
-                        del self.active_connections[user_id]
-        
-       
-        redis_client = await get_redis()
-        await redis_client.srem("online_users", user_id)
-        
-      
-        if user_id in self.user_groups:
-            del self.user_groups[user_id]
-        
-        
-        await self.broadcast_users()
-        
-        print(f"User {user_id} disconnected. Online users: {len(self.active_connections)}")
-
-    async def send_personal_message(self, message: str, user_id: str):
-        async with self.lock:
-            if user_id not in self.active_connections:
-                print(f"User {user_id} not connected, message not delivered")
-                return False
-            
-            try:
-                await self.active_connections[user_id].send_text(message)
-                print(f"Message delivered to {user_id}")
-                return True
-            except Exception as e:
-                print(f"Error sending message to {user_id}: {e}")
-               
-                if user_id in self.active_connections:
-                    try:
-                        await self.active_connections[user_id].close()
-                    except Exception:
-                        pass
-                    del self.active_connections[user_id]
-                return False
-
-    async def broadcast_to_group(self, message: str, group_id: str):
-        
-        redis_client = await get_redis()
-        group_members_key = f"group:{group_id}:members"
-        members = await redis_client.smembers(group_members_key)
-        
-        sent_count = 0
-        for member_id in members:
-            if await self.send_personal_message(message, member_id):
-                sent_count += 1
-        
-        print(f"Broadcasted message to {sent_count}/{len(members)} members of group {group_id}")
-
-    async def broadcast(self, message: str):
-       
-        disconnected = []
-        async with self.lock:
-            for user_id, connection in list(self.active_connections.items()):
-                try:
-                    await connection.send_text(message)
-                except Exception as e:
-                    print(f"Error broadcasting to {user_id}: {e}")
-                    disconnected.append(user_id)
-        
-        for user_id in disconnected:
-            await self.disconnect(user_id)
-
-    async def broadcast_users(self):
-        
-        redis_client = await get_redis()
-        online_users = await redis_client.smembers("online_users")
-        
-       
-        users_with_info = []
-        for user_id in online_users:
-            user_nickname = await redis_client.hget(f"user:{user_id}", "nickname")
-            if not user_nickname:
-                user_nickname = f"User {user_id}"
-            users_with_info.append({
-                "id": user_id,
-                "nickname": user_nickname,
-                "online": True
-            })
-        
-        users_message = {
-            "action": "users_online",
-            "users": users_with_info
-        }
-        
-        print(f"Broadcasting users update: {len(online_users)} online users")
-        message_json = json.dumps(users_message)
-        
-      
-        for user_id in list(self.active_connections.keys()):
-            await self.send_personal_message(message_json, user_id)
-
-    async def add_user_to_group(self, user_id: str, group_id: str):
-        
-        if user_id not in self.user_groups:
-            self.user_groups[user_id] = set()
-        self.user_groups[user_id].add(group_id)
-
-    async def get_user_groups(self, user_id: str):
-       
-        redis_client = await get_redis()
-        user_groups_key = f"user:{user_id}:groups"
-        return await redis_client.smembers(user_groups_key)
-
-    async def is_user_connected(self, user_id: str) -> bool:
-       
-        async with self.lock:
-            return user_id in self.active_connections
-
-manager = ConnectionManager()
-
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str = Query(...)):
+@app.on_event("startup")
+async def startup():
     
-    if token != f"token_{user_id}":
-        await websocket.close(code=1008)
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+
+async def broadcast_user_list():
+  
+    user_list = list(connected_users.keys())
+    for ws in connected_users.values():
+        await ws.send_json({"type": "user_list", "users": user_list})
+
+
+@app.websocket("/ws/{username}")
+async def websocket_endpoint(websocket: WebSocket, username: str):
+   
+    if username in connected_users:
+       
+        await websocket.close(code=1008, reason=f"Username '{username}' is already taken.")
         return
 
+    await websocket.accept()
+    connected_users[username] = websocket
+    print(f"Пользователь {username} подключился.")
+
+   
+    await broadcast_user_list()
+   
+    await send_user_groups(username)
+
     try:
-        await manager.connect(websocket, user_id)
-        redis_client = await get_redis()
-        
-        try:
-            while True:
-                data = await websocket.receive_text()
+        while True:
+            data = await websocket.receive_text()
+            print(f"Сообщение от {username}: {data}")
+            try:
                 message_data = json.loads(data)
-                action = message_data.get("action")
-                
-                print(f"Received action '{action}' from user {user_id}")
-                
-                if action == "send_message":
-                    await handle_send_message(user_id, message_data, redis_client)
-                    
-                elif action == "get_users":
-                    await handle_get_users(user_id, redis_client)
-                    
-                elif action == "create_group":
-                    await handle_create_group(user_id, message_data, redis_client)
-                    
-                elif action == "get_user_groups":
-                    await handle_get_user_groups(user_id, redis_client)
-                    
-                elif action == "get_group_messages":
-                    await handle_get_group_messages(user_id, message_data, redis_client)
-                    
-                elif action == "get_chat_history":
-                    await handle_get_chat_history(user_id, message_data, redis_client)
-                    
-                else:
-                    print(f"Unknown action: {action}")
-                    
-        except WebSocketDisconnect:
-            print(f"WebSocket disconnected for user {user_id}")
-        except Exception as e:
-            print(f"WebSocket error for user {user_id}: {e}")
-    except Exception as e:
-        print(f"Connection error for user {user_id}: {e}")
+                msg_type = message_data.get("type")
+
+                if msg_type == "personal_message":
+                    recipient = message_data.get("recipient")
+                    message = message_data.get("message")
+                    if recipient and message:
+                        await save_and_send_personal_message(username, recipient, message)
+
+                elif msg_type == "group_message":
+                    group_name = message_data.get("group_name")
+                    message = message_data.get("message")
+                    if group_name and message:
+                        await save_and_send_group_message(username, group_name, message)
+
+            except json.JSONDecodeError:
+                print(f"Некорректный JSON от {username}")
+            except Exception as e:
+                print(f"Ошибка при обработке сообщения: {e}")
+
+    except WebSocketDisconnect:
+        print(f"Пользователь {username} отключился.")
     finally:
-        await manager.disconnect(user_id)
+        if username in connected_users:
+            del connected_users[username]
+       
+        await broadcast_user_list()
 
-async def handle_send_message(user_id: str, message_data: dict, redis_client):
+
+async def save_and_send_personal_message(sender: str, recipient: str, message: str):
     
-    try:
-        chat_type = message_data["payload"].get("chat_type", "private")
+    async with async_session() as session:
+        async with session.begin():
+            stmt = insert(messages).values(sender=sender, recipient=recipient, content=message)
+            await session.execute(stmt)
+
+     
+        if recipient in connected_users:
+            recipient_ws = connected_users[recipient]
+            await recipient_ws.send_json({
+                "type": "personal_message",
+                "sender": sender,
+                "message": message
+            })
         
-        if chat_type == "private":
-            
-            message_id = str(uuid.uuid4())
-            target_user_id = message_data["payload"]["target_user_id"]
-            
-            if user_id < target_user_id:
-                chat_id = f"{user_id}_{target_user_id}"
-            else:
-                chat_id = f"{target_user_id}_{user_id}"
-            
-            message = {
-                "id": message_id,
-                "chat_id": chat_id,
-                "sender_id": user_id,
-                "content": message_data["payload"]["content"],
-                "created_at": datetime.now().isoformat(),
-                "target_user_id": target_user_id,
-                "chat_type": "private"
-            }
-            
-            print(f"Sending private message from {user_id} to {target_user_id}, chat_id: {chat_id}")
+       
+        if sender in connected_users:
+            sender_ws = connected_users[sender]
+            await sender_ws.send_json({
+                "type": "personal_message",
+                "sender": sender,
+                "recipient": recipient, 
+                "message": message
+            })
 
-            await redis_client.rpush(f"chat:{chat_id}:messages", json.dumps(message))
 
-            await redis_client.ltrim(f"chat:{chat_id}:messages", -100, -1)
-
-            sender_nickname = await redis_client.hget(f"user:{user_id}", "nickname")
-            if not sender_nickname:
-                sender_nickname = f"User {user_id}"
-            message["sender_nickname"] = sender_nickname
-
-            target_delivered = await manager.send_personal_message(json.dumps({
-                "action": "new_message",
-                "payload": message
-            }), target_user_id)
-
-            await manager.send_personal_message(json.dumps({
-                "action": "new_message", 
-                "payload": message
-            }), user_id)
+async def save_and_send_group_message(sender: str, group_name: str, message: str):
+    
+    async with async_session() as session:
+        async with session.begin():
             
-            if target_delivered:
-                print(f"✓ Message successfully delivered to {target_user_id}")
-            else:
-                print(f"✗ Failed to deliver message to {target_user_id} (user offline)")
-            
-        elif chat_type == "group":
+            stmt_msg = insert(messages).values(sender=sender, group_name=group_name, content=message)
+            await session.execute(stmt_msg)
+
           
-            message_id = str(uuid.uuid4())
-            group_id = message_data["payload"]["group_id"]
-            message = {
-                "id": message_id,
-                "group_id": group_id,
-                "sender_id": user_id,
-                "content": message_data["payload"]["content"],
-                "created_at": datetime.now().isoformat(),
-                "chat_type": "group",
-                "sender_nickname": message_data["payload"].get("sender_nickname", f"User {user_id}")
-            }
-            
-            print(f"Sending group message from {user_id} to group {group_id}")
+            stmt_members = select(group_members.c.username).where(group_members.c.group_name == group_name)
+            result = await session.execute(stmt_members)
+            members = [row[0] for row in result]
 
-            await redis_client.rpush(f"group:{group_id}:messages", json.dumps(message))
-            await redis_client.ltrim(f"group:{group_id}:messages", -100, -1)
-
-            await manager.broadcast_to_group(json.dumps({
-                "action": "new_group_message",
-                "payload": message
-            }), group_id)
-    except Exception as e:
-        print(f"Error handling send_message for user {user_id}: {e}")
-
-async def handle_get_users(user_id: str, redis_client):
-
-    try:
-        online_users = await redis_client.smembers("online_users")
-        
-        users_with_info = []
-        for online_user_id in online_users:
-            if online_user_id != user_id:  
-                user_nickname = await redis_client.hget(f"user:{online_user_id}", "nickname")
-                if not user_nickname:
-                    user_nickname = f"User {online_user_id}"
-                users_with_info.append({
-                    "id": online_user_id,
-                    "nickname": user_nickname,
-                    "online": True
+      
+        for member in members:
+            if member in connected_users:
+                await connected_users[member].send_json({
+                    "type": "group_message",
+                    "group_name": group_name,
+                    "sender": sender,
+                    "message": message
                 })
-        
-        users_message = {
-            "action": "users_online",
-            "users": users_with_info
-        }
-        
-        await manager.send_personal_message(json.dumps(users_message), user_id)
-        print(f"Sent users list to {user_id}: {len(users_with_info)} users")
-    except Exception as e:
-        print(f"Error handling get_users for user {user_id}: {e}")
 
-async def handle_create_group(user_id: str, message_data: dict, redis_client):
+
+@app.get("/history/personal/{user1}/{user2}")
+async def get_personal_chat_history(user1: str, user2: str):
+    
+    async with async_session() as session:
+        stmt = select(messages).where(
+            ((messages.c.sender == user1) & (messages.c.recipient == user2)) |
+            ((messages.c.sender == user2) & (messages.c.recipient == user1))
+        ).order_by(messages.c.id)
+        result = await session.execute(stmt)
+        history = [
+            {"sender": row.sender, "recipient": row.recipient, "message": row.content}
+            for row in result
+        ]
+        return history
+
+
+@app.get("/history/group/{group_name}")
+async def get_group_chat_history(group_name: str):
+    
+    async with async_session() as session:
+        stmt = select(messages).where(messages.c.group_name == group_name).order_by(messages.c.id)
+        result = await session.execute(stmt)
+        history = [
+            {"sender": row.sender, "group": row.group_name, "message": row.content}
+            for row in result
+        ]
+        return history
+
+@app.post("/groups/create")
+async def create_group(group_data: dict):
+    
+    group_name = group_data.get("group_name")
+    members = group_data.get("members") 
+    if not group_name or not members:
+        raise HTTPException(status_code=400, detail="Group name and members are required.")
+
+    async with async_session() as session:
+        async with session.begin():
+            
+            stmt_exist = select(groups).where(groups.c.name == group_name)
+            if (await session.execute(stmt_exist)).first():
+                raise HTTPException(status_code=400, detail="Group with this name already exists.")
+            
+            
+            stmt_group = insert(groups).values(name=group_name)
+            await session.execute(stmt_group)
+            
+            
+            for member in members:
+                stmt_member = insert(group_members).values(group_name=group_name, username=member)
+                await session.execute(stmt_member)
+
+ 
+    for member in members:
+        if member in connected_users:
+            await connected_users[member].send_json({"type": "group_update"})
+
+    return {"status": "success", "message": f"Group '{group_name}' created."}
+
+
+@app.get("/groups/{username}")
+async def get_user_groups(username: str):
    
-    try:
-        group_id = str(uuid.uuid4())
-        group_name = message_data["payload"]["group_name"]
-        
-        members_dict = message_data["payload"]["members"]
-        members = [members_dict[key] for key in members_dict if key in members_dict]
-        
-        print(f"Creating group: {group_name} with members: {members}")
+    async with async_session() as session:
+        stmt = select(group_members.c.group_name).where(group_members.c.username == username)
+        result = await session.execute(stmt)
+        user_groups = [row[0] for row in result]
+        return {"groups": user_groups}
 
-        await redis_client.hset(f"group:{group_id}", mapping={
-            "name": group_name,
-            "creator": user_id,
-            "created_at": datetime.now().isoformat()
+async def send_user_groups(username: str):
+    
+    if username in connected_users:
+        groups_data = await get_user_groups(username)
+        await connected_users[username].send_json({
+            "type": "group_list",
+            "groups": groups_data.get("groups", [])
         })
-
-        all_members = set(members) | {user_id}
-        for member_id in all_members:
-            await redis_client.sadd(f"group:{group_id}:members", member_id)
-            await redis_client.sadd(f"user:{member_id}:groups", group_id)
-            await manager.add_user_to_group(member_id, group_id)
-
-        members_list = list(all_members)
-        group_info = {
-            "group_id": group_id,
-            "name": group_name,
-            "creator": user_id,
-            "members": members_list
-        }
-        
-        print(f"✓ Group created: {group_info}")
-
-        await manager.send_personal_message(json.dumps({
-            "action": "group_created",
-            "payload": group_info
-        }), user_id)
-
-        for member_id in all_members:
-            if member_id != user_id: 
-                await manager.send_personal_message(json.dumps({
-                    "action": "added_to_group",
-                    "payload": group_info
-                }), member_id)
-                print(f"Notified user {member_id} about group")
-    except Exception as e:
-        print(f"Error handling create_group for user {user_id}: {e}")
-
-async def handle_get_user_groups(user_id: str, redis_client):
-    
-    try:
-        user_groups_key = f"user:{user_id}:groups"
-        group_ids = await redis_client.smembers(user_groups_key)
-        
-        groups_info = []
-        for group_id in group_ids:
-            group_data = await redis_client.hgetall(f"group:{group_id}")
-            if group_data:
-               
-                members = await redis_client.smembers(f"group:{group_id}:members")
-                group_info = {
-                    "group_id": group_id,
-                    "name": group_data.get("name", "Unnamed Group"),
-                    "creator": group_data.get("creator", ""),
-                    "members": list(members)
-                }
-                groups_info.append(group_info)
-        
-        await manager.send_personal_message(json.dumps({
-            "action": "user_groups",
-            "payload": groups_info
-        }), user_id)
-        print(f"Sent {len(groups_info)} groups to user {user_id}")
-    except Exception as e:
-        print(f"Error handling get_user_groups for user {user_id}: {e}")
-
-async def handle_get_group_messages(user_id: str, message_data: dict, redis_client):
-    
-    try:
-        group_id = message_data["payload"]["group_id"]
-        messages = await redis_client.lrange(f"group:{group_id}:messages", 0, -1)
-        parsed_messages = [json.loads(msg) for msg in messages]
-        
-        await manager.send_personal_message(json.dumps({
-            "action": "group_messages",
-            "payload": {
-                "group_id": group_id,
-                "messages": parsed_messages
-            }
-        }), user_id)
-        print(f"Sent {len(parsed_messages)} group messages to user {user_id}")
-    except Exception as e:
-        print(f"Error handling get_group_messages for user {user_id}: {e}")
-
-async def handle_get_chat_history(user_id: str, message_data: dict, redis_client):
-   
-    try:
-        target_user_id = message_data["payload"]["target_user_id"]
-
-        if user_id < target_user_id:
-            chat_id = f"{user_id}_{target_user_id}"
-        else:
-            chat_id = f"{target_user_id}_{user_id}"
-
-        messages = await redis_client.lrange(f"chat:{chat_id}:messages", 0, -1)
-        parsed_messages = [json.loads(msg) for msg in messages]
-
-        for message in parsed_messages:
-            sender_id = message["sender_id"]
-            sender_nickname = await redis_client.hget(f"user:{sender_id}", "nickname")
-            if not sender_nickname:
-                sender_nickname = f"User {sender_id}"
-            message["sender_nickname"] = sender_nickname
-        
-        await manager.send_personal_message(json.dumps({
-            "action": "chat_history",
-            "payload": {
-                "chat_id": chat_id,
-                "messages": parsed_messages
-            }
-        }), user_id)
-        print(f"Sent {len(parsed_messages)} chat history messages to user {user_id}")
-    except Exception as e:
-        print(f"Error handling get_chat_history for user {user_id}: {e}")
-
-@app.get("/")
-async def root():
-    return {"message": "Chat API is running"}
-
-@app.get("/api/users")
-async def get_users():
-    redis_client = await get_redis()
-    online_users = await redis_client.smembers("online_users")
-    
-    users = []
-    for user_id in online_users:
-        user_nickname = await redis_client.hget(f"user:{user_id}", "nickname")
-        if not user_nickname:
-            user_nickname = f"User {user_id}"
-        users.append({
-            "id": user_id,
-            "nickname": user_nickname,
-            "online": True
-        })
-    
-    return users
-
-@app.post("/api/login")
-async def login(user_data: dict):
-    nickname = user_data.get("nickname", "").strip()
-    if not nickname:
-        raise HTTPException(status_code=400, detail="Nickname is required")
-    
-    user_id = str(abs(hash(nickname)))[-8:]
-    
-    redis_client = await get_redis()
-    await redis_client.hset(f"user:{user_id}", "nickname", nickname)
-    
-    return {
-        "access_token": f"token_{user_id}",
-        "token_type": "bearer", 
-        "user_id": user_id
-    }
-
-@app.get("/health")
-async def health_check():
-    try:
-        redis_client = await get_redis()
-        await redis_client.ping()
-        return {"status": "healthy", "redis": "connected"}
-    except Exception as e:
-        return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
